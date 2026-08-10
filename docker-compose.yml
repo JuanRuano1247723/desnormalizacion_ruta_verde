@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: ruta_verde_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rutaverde
+      POSTGRES_PASSWORD: rutaverde
+      POSTGRES_DB: rutaverde
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # datos persistentes del propio Postgres
+      - ./datos:/datos                    # aqui monta los CSV generados por generar_datos.py
+      - ./sql:/sql                        # scripts de schema, carga y queries
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "work_mem=64MB"]
+
+volumes:
+  pgdata:
