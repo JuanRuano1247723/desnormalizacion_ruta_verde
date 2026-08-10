@@ -69,42 +69,84 @@ real del disco.
   de `pedido_plano` (no directamente de `pedido`), para no repetir
   los joins de la primera etapa.
 
-## 4. Trade-offs a justificar
-
-> **[ COMPLETAR ]** — Esta sección se llena con los resultados reales
-> de correr `sql/03_queries_ejemplo.sql` (normalizado) y
-> `sql/05_queries_desnormalizado.sql` (desnormalizado) sobre tus
-> propios datos generados.
+## 4. Trade-offs
 
 ### 4.1 Velocidad
 
-| Consulta | Tiempo normalizado (ms) | Tiempo desnormalizado (ms) | Diferencia |
-|----------|--------------------------|------------------------------|------------|
-| Query 1 — ventas por departamento | | | |
-| Query 2 — estadísticas por segmento | | | |
-| Query 3 — ventas mensuales por zona | | | |
-| Query 4 — top restaurantes | | | |
+> Nota metodológica: en el modelo normalizado, las queries 1 y 2 se
+> midieron con `SELECT * FROM vista` (tiempo total reportado por
+> `psql`, incluye transferencia del resultado al cliente). Las
+> queries 3 y 4, en cambio, sí se corrieron con `EXPLAIN ANALYZE` en
+> ambos modelos, así que ahí la comparación de `Execution Time` es
+> directa. Para 1 y 2 se usó el tiempo total como aproximación —no es
+> perfectamente equivalente, pero la magnitud de la diferencia hace
+> que la conclusión no cambie.
 
-*(Tomar el tiempo de `EXPLAIN ANALYZE`, específicamente `Execution Time`,
-no `Planning Time`.)*
+| Consulta | Tiempo normalizado | Tiempo desnormalizado | Mejora |
+|----------|---------------------|--------------------------|--------|
+| Query 1 — ventas por departamento | 1089.39 ms *(tiempo total)* | 250.29 ms *(Execution Time)* | ~4.3× |
+| Query 2 — estadísticas por segmento | 455.62 ms *(tiempo total)* | 255.45 ms *(Execution Time)* | ~1.8× |
+| Query 3 — ventas mensuales por zona | 2264.82 ms *(Execution Time)* | 70.32 ms *(Execution Time)* | ~32.2× |
+| Query 4 — top restaurantes | 508.96 ms *(Execution Time)* | 2.35 ms *(Execution Time)* | ~216.6× |
 
-**Análisis:** [ completar — ¿el pre-join efectivamente evitó los
-joins según el plan de ejecución? ¿la tabla agregada dejó de hacer
-seq scan sobre `pedido`? ¿hubo alguna consulta donde la mejora fue
-menor a la esperada, y por qué? ]
+**Lectura de los planes de ejecución:**
+
+- **Query 1 y 2**: el plan sobre `pedido_plano` ya no muestra ningún
+  `Hash Join` — es un `Parallel Seq Scan` directo sobre la tabla
+  ancha seguido de la agregación. El pre-join cumplió exactamente lo
+  esperado: sacó el costo del join fuera del camino crítico de la
+  consulta (se paga una sola vez, al construir `pedido_plano`, no en
+  cada ejecución).
+- **Query 3**: el salto es el más dramático de los dos casos de tabla
+  agregada porque el plan original tenía que hacer `Hash Join` de
+  `pedido` (3M filas) contra `restaurante` y `zona`, más un
+  `HashAggregate` con 8 particiones sobre 2.19M grupos estimados. El
+  plan desnormalizado es un `Seq Scan` sobre una tabla de apenas
+  72,000 filas — ya no toca `pedido` en absoluto.
+- **Query 4**: acá está la mejora más grande de las cuatro
+  (~217×). Tiene sentido: era la consulta que barría 3M filas en
+  paralelo (`Parallel Seq Scan on pedido`) solo para agrupar por
+  restaurante y quedarse con 10 filas. Contra `resumen_ventas_restaurante`
+  (20,000 filas ya agregadas) el trabajo es casi inmediato.
+- El caso con menor mejora relativa es **Query 2 (~1.8×)**: aun en el
+  modelo normalizado, esa consulta ya era relativamente barata
+  (455 ms sobre 3M filas con un solo join contra `cliente`), así que
+  había menos margen para ganar. Esto es consistente con la
+  clasificación original: query 2 se trataba de una *columna
+  derivada* (costo de cómputo repetido), no de un *pre-join* pesado
+  como la query 1 — el ahorro que ofrece es más modesto por
+  naturaleza.
 
 ### 4.2 Espacio
 
-| Tabla | Tamaño normalizado | Tamaño desnormalizado equivalente |
-|-------|----------------------|--------------------------------------|
-| `pedido` vs `pedido_plano` | | |
-| (suma de dimensiones) vs incluido en `pedido_plano` | | |
-| — vs `resumen_ventas_zona_mes` | — | |
-| — vs `resumen_ventas_restaurante` | — | |
+| Tabla | Tamaño total | Tabla | Índices |
+|-------|---------------|-------|---------|
+| `pedido` (normalizado) | 353 MB | 196 MB | 158 MB |
+| `pedido_plano` (desnormalizado) | 583 MB | 457 MB | 126 MB |
+| `resumen_ventas_zona_mes` | 6.9 MB | 4.6 MB | 2.2 MB |
+| `resumen_ventas_restaurante` | 2.4 MB | 1.5 MB | 0.8 MB |
 
-**Análisis:** [ completar — ¿cuánto más pesa `pedido_plano` que
-`pedido` solo, y por qué (tipo de dato repetido: texto vs entero)?
-¿el peso de las tablas agregadas es despreciable en comparación? ]
+**Análisis:**
+
+- `pedido_plano` pesa **~65% más en total** que `pedido` solo (583 MB
+  vs 353 MB), y el crecimiento está concentrado en el tamaño de la
+  tabla en sí (457 MB vs 196 MB, **2.3× más grande**): cada fila ahora
+  carga texto repetido (`zona_nombre`, `municipio_nombre`,
+  `departamento_nombre`, `restaurante_nombre`, `segmento`) en vez de
+  enteros de 4 bytes que apuntaban a esas mismas cadenas guardadas
+  una sola vez en las tablas normalizadas.
+- Curiosamente, los **índices de `pedido_plano` pesan menos**
+  (126 MB) que los de `pedido` (158 MB), a pesar de que la tabla base
+  es más grande. [ *punto para tu propia justificación:* ¿tiene que
+  ver con la cantidad de índices definidos en cada caso, con el tipo
+  de dato indexado (texto vs entero), o con algo del orden físico de
+  los datos? Vale la pena revisar `\di+` sobre ambas tablas. ]
+- Las dos tablas agregadas son **prácticamente gratis en espacio**
+  (6.9 MB y 2.4 MB, juntas no llegan al 2% del tamaño de
+  `pedido_plano`), a cambio de las mejoras de 32× y 217× medidas
+  arriba. Ese es el trade-off más claro de los cuatro: para las
+  queries 3 y 4, la desnormalización no tiene casi contraindicación
+  de espacio.
 
 ### 4.3 Consistencia y mantenimiento
 
